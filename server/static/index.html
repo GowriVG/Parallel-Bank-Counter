@@ -1,0 +1,81 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Parallel Bank Dashboard</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.5/socket.io.min.js"></script>
+  <style>
+    body { 
+  font-family: Arial; 
+  margin: 16px; 
+  padding: 16px; 
+}
+
+    .panel { display:flex; gap:20px; align-items: flex-start; }
+    .box { border: 1px solid #ddd; padding: 12px; border-radius: 6px; width:320px; }
+    #clients { display:flex; gap:8px; flex-wrap:wrap; }
+    .client { padding:8px; border-radius:6px; border:1px solid #ccc; min-width:140px; }
+    .busy { background:#ffecec; }
+    .free { background:#ecffe8; }
+  </style>
+</head>
+<body>
+  <h2>Parallel Bank — Live Dashboard</h2>
+  <div class="panel">
+    <div class="box">
+      <h3>Central Queue</h3>
+      <div>Queue size: <span id="queue_size">0</span></div>
+      <pre id="queue_preview">[]</pre>
+    </div>
+
+    <div class="box">
+      <h3>Clients</h3>
+      <div id="clients">No clients</div>
+    </div>
+
+    <div class="box">
+      <h3>Metrics</h3>
+      <div>Total generated: <span id="m_gen">0</span></div>
+      <div>Total dispatched: <span id="m_disp">0</span></div>
+      <div>Total completed: <span id="m_comp">0</span></div>
+      <div>Last update: <span id="last_update">-</span></div>
+    </div>
+  </div>
+
+<script>
+  const socket = io();
+
+  function renderClients(info) {
+    const cont = document.getElementById('clients');
+    cont.innerHTML = '';
+    const keys = Object.keys(info);
+    if (keys.length === 0) { cont.innerText = 'No clients connected'; return; }
+    for (const id of keys) {
+      const v = info[id];
+      const div = document.createElement('div');
+      div.className = 'client ' + (v.busy ? 'busy' : 'free');
+      div.innerHTML = `<strong>${id}</strong><div>${v.addr ? v.addr[0]+':'+v.addr[1] : ''}</div><div>${v.busy ? 'Busy' : 'Free'}</div>`;
+      cont.appendChild(div);
+    }
+  }
+
+  socket.on('snapshot', s => {
+    document.getElementById('queue_size').innerText = s.queue_size;
+    document.getElementById('queue_preview').innerText = 'Queue size: ' + s.queue_size;
+    document.getElementById('m_gen').innerText = s.metrics.total_generated;
+    document.getElementById('m_disp').innerText = s.metrics.total_dispatched;
+    document.getElementById('m_comp').innerText = s.metrics.total_completed;
+    document.getElementById('last_update').innerText = new Date(s.time*1000).toLocaleTimeString();
+    renderClients(s.clients);
+  });
+
+  socket.on('connect', () => {
+    console.log('connected to server dashboard');
+  });
+
+  socket.on('disconnect', () => {
+    console.log('disconnected from server dashboard');
+  });
+</script>
+</body>
+</html>
