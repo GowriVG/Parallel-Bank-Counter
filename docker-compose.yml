@@ -1,27 +1,14 @@
-version: "3.8"
+
 services:
   server:
     build: ./server
     ports:
       - "5000:5000"   # web UI
       - "9999:9999"   # tcp for clients
-    volumes:
-      - ./server/static:/app/static
+    # volumes:
+    #   - ./server/static:/app/static
     restart: unless-stopped
-
-  client1:
-    build: ./client
-    depends_on:
-      - server
-    restart: unless-stopped
-
-  client2:
-    build: ./client
-    depends_on:
-      - server
-    restart: unless-stopped
-
-  client3:
+  client:
     build: ./client
     depends_on:
       - server

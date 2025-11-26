@@ -28,9 +28,15 @@ WS_PORT = 5000        # dashboard port
 HEARTBEAT_INTERVAL = 2.0
 HEARTBEAT_TIMEOUT = 6.0
 
-CUSTOMER_MEAN = 1.2   # avg inter-arrival seconds
-SERVICE_MIN = 2.0
-SERVICE_MAX = 5.0
+#CUSTOMER_MEAN = 1.2   # avg inter-arrival seconds
+CUSTOMER_MEAN = 0.2   # 6× faster arrivals
+
+# SERVICE_MIN = 2.0
+# SERVICE_MAX = 5.0
+SERVICE_MIN = 8
+SERVICE_MAX = 14
+
+
 
 LOCAL_CPU_WORKERS = 2  # number of local pool processes
 
@@ -113,7 +119,9 @@ def customer_generator(stop_event):
 def cpu_heavy_task(cust):
     # Simulate CPU work proportional to service_time
     st = max(1.0, cust.get("service_time", 2.0))
-    iterations = int(150000 * st)
+    # iterations = int(150000 * st)
+    iterations = int(15000000 * st)   # 100x heavier
+
     acc = 0
     for i in range(iterations):
         acc += (i ^ (i << 1)) & 0xFFFF
@@ -288,8 +296,19 @@ def handle_client_message(cid, msg):
 
 # ---------------- Snapshot for dashboard ----------------
 def make_snapshot():
+    # with clients_lock:
+    #     clients_info = {cid: {"busy": info.get("busy"), "last_heartbeat": info.get("last_heartbeat"), "addr": info.get("addr")} for cid, info in clients.items()}
     with clients_lock:
-        clients_info = {cid: {"busy": info.get("busy"), "last_heartbeat": info.get("last_heartbeat"), "addr": info.get("addr")} for cid, info in clients.items()}
+        clients_info = {
+            cid: {
+                "busy": info.get("busy"),
+                "last_heartbeat": info.get("last_heartbeat"),
+                "addr": info.get("addr"),
+                "current_job": info.get("current_job")   # ➜ Added this line
+            }
+            for cid, info in clients.items()
+    }
+
     qsize = central_queue.qsize()
     with metrics_lock:
         m = metrics.copy()
@@ -336,7 +355,9 @@ if __name__ == "__main__":
 
     # run flask socketio (this blocks; snapshot_emitter thread sends updates)
     print(f"[MAIN] Web dashboard at http://0.0.0.0:{WS_PORT}")
-    sio.run(app, host="0.0.0.0", port=WS_PORT)
+    # sio.run(app, host="0.0.0.0", port=WS_PORT)
+    sio.run(app, host="0.0.0.0", port=WS_PORT, allow_unsafe_werkzeug=True)
+
     # when socketio stops, set stop_event to shut threads (rare in development)
     stop_event.set()
     local_pool.close()
