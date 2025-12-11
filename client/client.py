@@ -54,10 +54,7 @@ def handle_server(sock, simulate_cpu):
                 cust = msg.get('customer_id')
                 st = float(msg.get('service_time', 2.0))
                 print(f"[CLIENT] Received job {cust} st={st}")
-                # if simulate_cpu:
-                #     cpu_heavy(st)
                 if simulate_cpu:
-                    time.sleep(2)      # extra delay
                     cpu_heavy(st)
                 else:
                     time.sleep(st)

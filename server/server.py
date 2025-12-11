@@ -1,15 +1,11 @@
 """
-server.py
-- TCP server (port 9999) that accepts worker clients
-- Heartbeat-based fault detection and automatic reassignment
-- Central job generator (simulates arriving customers)
-- Dispatcher: assigns jobs to connected clients or local pool
-- Local CPU-bound processing via multiprocessing.Pool
-- Web dashboard using Flask + Flask-SocketIO (threading)
-Notes:
-- Multiprocessing Pool is created inside main to be Windows-safe.
-- Run: python server.py
+server.py - Banking Multiprogramming Server (enhanced)
+- Emits per-worker utilization and job-history
+- Emits logs to dashboard
+- Dashboard controls: pause/resume, adjust arrival mean
+Run: python server.py
 """
+
 import socket
 import threading
 import json
@@ -17,58 +13,22 @@ import time
 import random
 import queue
 import sqlite3
-from multiprocessing import Pool
-from flask import Flask, send_from_directory
+from flask import Flask, send_from_directory, request
 from flask_socketio import SocketIO
 
 # ---------------- CONFIG ----------------
-HOST = ""             # bind all interfaces
-TCP_PORT = 9999       # port for TCP clients (workers)
-WS_PORT = 5000        # dashboard port
+HOST = ""
+TCP_PORT = 9999
+WS_PORT = 5000
+
 HEARTBEAT_INTERVAL = 2.0
 HEARTBEAT_TIMEOUT = 6.0
 
-#CUSTOMER_MEAN = 1.2   # avg inter-arrival seconds
-CUSTOMER_MEAN = 0.2   # 6× faster arrivals
-
-# SERVICE_MIN = 2.0
-# SERVICE_MAX = 5.0
-SERVICE_MIN = 8
-SERVICE_MAX = 14
-
-
-
-LOCAL_CPU_WORKERS = 2  # number of local pool processes
+CUSTOMER_MEAN = 1.2   # this is adjustable from UI
+SERVICE_MIN = 2.0
+SERVICE_MAX = 5.0
 
 DB_FILE = "server_data.db"
-
-# ---------------- DB helper (simple sqlite logging) ----------------
-def init_db():
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute("""CREATE TABLE IF NOT EXISTS customers (
-                 id INTEGER PRIMARY KEY,
-                 arrival REAL, dispatched REAL, started REAL, finished REAL,
-                 service_time REAL, assigned_worker TEXT)""")
-    conn.commit()
-    conn.close()
-
-def db_upsert(cust):
-    # cust: dict with keys customer_id, arrival, dispatched, started, finished, service_time, assigned_worker
-    conn = sqlite3.connect(DB_FILE)
-    c = conn.cursor()
-    c.execute("""INSERT OR REPLACE INTO customers
-                 (id, arrival, dispatched, started, finished, service_time, assigned_worker)
-                 VALUES (?, ?, ?, ?, ?, ?, ?)""",
-              (cust.get("customer_id"),
-               cust.get("arrival"),
-               cust.get("dispatched"),
-               cust.get("started"),
-               cust.get("finished"),
-               cust.get("service_time"),
-               cust.get("assigned_worker")))
-    conn.commit()
-    conn.close()
 
 # ---------------- Flask + SocketIO ----------------
 app = Flask(__name__, static_folder="static")
@@ -78,67 +38,112 @@ sio = SocketIO(app, async_mode="threading", cors_allowed_origins="*")
 def index():
     return send_from_directory("static", "index.html")
 
-# ---------------- Shared state (in-process, thread-safe with locks) ----------------
+# ---------------- DB helper ----------------
+def init_db():
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS customers (
+            id INTEGER PRIMARY KEY,
+            arrival REAL,
+            dispatched REAL,
+            started REAL,
+            finished REAL,
+            service_time REAL,
+            assigned_worker TEXT
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+def db_upsert(cust):
+    # cust: may contain keys: customer_id, arrival, dispatched, started, finished, service_time, assigned_worker
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("""
+        INSERT OR REPLACE INTO customers
+        (id, arrival, dispatched, started, finished, service_time, assigned_worker)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+    """, (
+        cust.get("customer_id"),
+        cust.get("arrival"),
+        cust.get("dispatched"),
+        cust.get("started"),
+        cust.get("finished"),
+        cust.get("service_time"),
+        cust.get("assigned_worker"),
+    ))
+    conn.commit()
+    conn.close()
+
+def recent_jobs(limit=30):
+    conn = sqlite3.connect(DB_FILE)
+    c = conn.cursor()
+    c.execute("SELECT id, arrival, dispatched, started, finished, service_time, assigned_worker FROM customers ORDER BY id DESC LIMIT ?", (limit,))
+    rows = c.fetchall()
+    conn.close()
+    jobs = []
+    for r in rows:
+        jobs.append({
+            "customer_id": r[0],
+            "arrival": r[1],
+            "dispatched": r[2],
+            "started": r[3],
+            "finished": r[4],
+            "service_time": r[5],
+            "assigned_worker": r[6]
+        })
+    return jobs
+
+# ---------------- Shared state ----------------
 central_queue = queue.Queue()
-clients = {}            # client_id -> {sock, addr, busy(bool), last_heartbeat, current_job}
+clients = {}   # client_id -> { sock, addr, busy, last_heartbeat, current_job, jobs_done, busy_time, last_active, started_ts }
 clients_lock = threading.Lock()
 
-metrics = {
-    "total_generated": 0,
-    "total_dispatched": 0,
-    "total_completed": 0
-}
+metrics = {"total_generated": 0, "total_dispatched": 0, "total_completed": 0}
 metrics_lock = threading.Lock()
 
-# pool will be created in main()
-local_pool = None
+# control flags
+control = {
+    "running": True,
+    "customer_mean": CUSTOMER_MEAN
+}
+
+# ---------------- logging helper (also emits to UI) ----------------
+def server_log(msg):
+    ts = time.strftime("%H:%M:%S")
+    line = f"[{ts}] {msg}"
+    print(line)
+    try:
+        sio.emit("log", line)
+    except Exception:
+        pass
 
 # ---------------- Customer generator ----------------
 cust_seq = 1
-def customer_generator(stop_event):
+def customer_generator(stop):
     global cust_seq
-    while not stop_event.is_set():
-        delay = max(0.2, random.expovariate(1.0 / CUSTOMER_MEAN))
+    while not stop.is_set():
+        if not control["running"]:
+            time.sleep(0.5)
+            continue
+        mean = control.get("customer_mean", CUSTOMER_MEAN)
+        delay = max(0.2, random.expovariate(1.0 / mean))
         time.sleep(delay)
         cid = cust_seq
         cust_seq += 1
         st = round(random.uniform(SERVICE_MIN, SERVICE_MAX), 2)
-        cust = {
-            "customer_id": cid,
-            "arrival": time.time(),
-            "service_time": st
-        }
+        cust = {"customer_id": cid, "arrival": time.time(), "service_time": st}
         central_queue.put(cust)
-        db_upsert({**cust})
+        db_upsert(cust)
         with metrics_lock:
             metrics["total_generated"] += 1
-        print(f"[GENERATOR] New customer {cid} st={st}")
+        server_log(f"New customer {cid} st={st}")
         emit_snapshot()
 
-# ---------------- CPU-bound task (runs in worker process) ----------------
-def cpu_heavy_task(cust):
-    # Simulate CPU work proportional to service_time
-    st = max(1.0, cust.get("service_time", 2.0))
-    # iterations = int(150000 * st)
-    iterations = int(15000000 * st)   # 100x heavier
-
-    acc = 0
-    for i in range(iterations):
-        acc += (i ^ (i << 1)) & 0xFFFF
-    # record started/finished times (in main process we will update started/finished)
-    return cust["customer_id"]
-
-# callback runs in main thread after pool completes
-def local_done_callback(cust_id):
-    # update metrics and snapshot
-    with metrics_lock:
-        metrics["total_completed"] += 1
-    print(f"[LOCAL] Completed customer {cust_id}")
-    emit_snapshot()
-
-# ---------------- Dispatcher: assign to free clients or local pool ----------------
-def dispatcher(stop_event):
-    while not stop_event.is_set():
+# ---------------- Dispatcher ----------------
+def dispatcher(stop):
+    while not stop.is_set():
         try:
             cust = central_queue.get(timeout=0.5)
         except queue.Empty:
@@ -146,173 +151,208 @@ def dispatcher(stop_event):
 
         assigned = False
         with clients_lock:
-            # try find a free client
-            for cid, info in list(clients.items()):
+            # assign to first free client
+            for cid, info in clients.items():
                 if not info.get("busy"):
                     try:
-                        sock = info["sock"]
-                        msg = {"type":"job","customer_id":cust["customer_id"], "service_time":cust["service_time"]}
-                        sock.sendall((json.dumps(msg) + "\n").encode())
+                        msg = {"type":"job","customer_id":cust["customer_id"],"service_time":cust["service_time"]}
+                        info["sock"].sendall((json.dumps(msg) + "\n").encode())
                         info["busy"] = True
                         info["current_job"] = cust
                         info["last_heartbeat"] = time.time()
-                        clients[cid] = info
-                        assigned = True
+                        info["started_ts"] = time.time()
+
                         cust["dispatched"] = time.time()
+                        cust["started"] = info["started_ts"]
                         cust["assigned_worker"] = cid
                         db_upsert(cust)
+
+                        info["jobs_done"] = info.get("jobs_done", 0)  # ensure exists
+                        # don't increment on dispatch, increment on done
+
                         with metrics_lock:
                             metrics["total_dispatched"] += 1
-                        print(f"[DISPATCH] Sent customer {cust['customer_id']} -> {cid}")
+
+                        server_log(f"DISPATCH: Customer {cust['customer_id']} -> {cid}")
+                        assigned = True
                         break
                     except Exception as e:
-                        print("[DISPATCH] send error to", cid, e)
-                        # mark client dead; will be cleaned by monitor
+                        server_log(f"Dispatch send error to {cid}: {e}")
                         continue
 
         if not assigned:
-            # send to local pool
-            cust["dispatched"] = time.time()
-            cust["assigned_worker"] = "local_pool"
-            db_upsert(cust)
-            with metrics_lock:
-                metrics["total_dispatched"] += 1
-            # record start time in main, then submit
-            cust["started"] = time.time()
-            if local_pool:
-                local_pool.apply_async(cpu_heavy_task, args=(cust,), callback=lambda cid: local_done_callback(cid))
-                print(f"[DISPATCH] Sent customer {cust['customer_id']} -> local_pool")
-            else:
-                # fallback: do in a background thread sleep
-                def fallback(c):
-                    time.sleep(c.get("service_time", 2))
-                    local_done_callback(c["customer_id"])
-                threading.Thread(target=fallback, args=(cust,), daemon=True).start()
+            # no free remote client -> put back into central queue
+            central_queue.put(cust)
 
         emit_snapshot()
 
-# ---------------- Monitor clients for heartbeat timeouts ----------------
-def monitor_clients(stop_event):
-    while not stop_event.is_set():
+# ---------------- Heartbeat monitor ----------------
+def monitor_clients(stop):
+    while not stop.is_set():
         now = time.time()
         dead = []
         with clients_lock:
             for cid, info in list(clients.items()):
                 last = info.get("last_heartbeat", 0)
                 if now - last > HEARTBEAT_TIMEOUT:
-                    print(f"[MONITOR] Client {cid} timed out (last hb {now-last:.1f}s).")
+                    server_log(f"MONITOR: {cid} timed out (last hb {now-last:.1f}s)")
                     cur = info.get("current_job")
                     if cur:
-                        print(f"[MONITOR] Reassigning customer {cur['customer_id']} back to central queue")
+                        server_log(f"MONITOR: Requeueing customer {cur['customer_id']}")
                         central_queue.put(cur)
                     dead.append(cid)
             for cid in dead:
                 try:
-                    sock = clients[cid]["sock"]
-                    try:
-                        sock.close()
-                    except:
-                        pass
+                    clients[cid]["sock"].close()
                 except:
                     pass
                 clients.pop(cid, None)
         emit_snapshot()
-        time.sleep(1.5)
+        time.sleep(1)
 
-# ---------------- TCP accept and recv loops ----------------
-def accept_clients(stop_event):
+# ---------------- TCP Server ----------------
+def accept_clients(stop):
     serv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     serv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     serv.bind((HOST, TCP_PORT))
-    serv.listen(10)
-    serv.settimeout(1.0)
-    print(f"[TCP] Listening on port {TCP_PORT}")
-    while not stop_event.is_set():
+    serv.listen(20)
+    serv.settimeout(1)
+    server_log(f"TCP listening on port {TCP_PORT}")
+
+    while not stop.is_set():
         try:
             conn, addr = serv.accept()
         except socket.timeout:
             continue
         cid = f"client_{int(time.time()*1000)%100000}"
         with clients_lock:
-            clients[cid] = {"sock":conn, "addr":addr, "busy":False, "last_heartbeat":time.time(), "current_job":None}
-        print(f"[TCP] Connected {cid} from {addr}")
+            clients[cid] = {
+                "sock": conn,
+                "addr": addr,
+                "busy": False,
+                "last_heartbeat": time.time(),
+                "current_job": None,
+                "jobs_done": 0,
+                "busy_time": 0.0,
+                "last_active": time.time(),
+                "started_ts": None
+            }
+        server_log(f"TCP Connected: {cid} from {addr}")
         try:
             conn.sendall((json.dumps({"type":"assign","id":cid}) + "\n").encode())
         except:
             pass
-        threading.Thread(target=client_recv_loop, args=(cid,conn), daemon=True).start()
+        threading.Thread(target=client_recv_loop, args=(cid, conn), daemon=True).start()
         emit_snapshot()
 
 def client_recv_loop(cid, conn):
-    buf = b''
+    buf = b""
     try:
         while True:
             data = conn.recv(4096)
             if not data:
                 break
             buf += data
-            while b'\n' in buf:
-                line, buf = buf.split(b'\n', 1)
+            while b"\n" in buf:
+                line, buf = buf.split(b"\n", 1)
                 if not line:
                     continue
                 try:
                     msg = json.loads(line.decode())
-                except Exception:
+                except:
                     continue
-                handle_client_message(cid, msg)
+                handle_message(cid, msg)
     except Exception as e:
-        print("[client_recv_loop] error", e)
+        server_log(f"[client_recv_loop] error {e}")
     finally:
-        print(f"[TCP] connection closed {cid}")
+        server_log(f"TCP Closed: {cid}")
         with clients_lock:
             info = clients.pop(cid, None)
             if info and info.get("current_job"):
                 central_queue.put(info["current_job"])
         emit_snapshot()
 
-def handle_client_message(cid, msg):
+def handle_message(cid, msg):
     typ = msg.get("type")
+    now = time.time()
+    with clients_lock:
+        if cid not in clients:
+            return
+
     if typ == "heartbeat":
         with clients_lock:
-            if cid in clients:
-                clients[cid]["last_heartbeat"] = time.time()
+            clients[cid]["last_heartbeat"] = now
+
     elif typ == "done":
         customer_id = msg.get("customer_id")
         service_time = msg.get("service_time")
         finished = time.time()
-        record = {"customer_id": customer_id, "finished": finished, "service_time": service_time, "assigned_worker": cid}
-        db_upsert(record)
+
+        # update DB & metrics; update client stats
         with clients_lock:
-            if cid in clients:
-                clients[cid]["busy"] = False
-                clients[cid]["current_job"] = None
+            info = clients.get(cid)
+            if info:
+                info["busy"] = False
+                cur = info.get("current_job")
+                start_ts = info.get("started_ts") or cur.get("started") if cur else None
+                if start_ts:
+                    delta = finished - start_ts
+                    info["busy_time"] = info.get("busy_time", 0.0) + delta
+                info["jobs_done"] = info.get("jobs_done", 0) + 1
+                info["current_job"] = None
+                info["started_ts"] = None
+                info["last_active"] = time.time()
+
+        db_upsert({
+            "customer_id": customer_id,
+            "finished": finished,
+            "service_time": service_time,
+            "assigned_worker": cid
+        })
+
         with metrics_lock:
             metrics["total_completed"] += 1
-        print(f"[DONE] Client {cid} finished customer {customer_id}")
-        emit_snapshot()
-    else:
-        # unknown message types may be supported later
-        pass
 
-# ---------------- Snapshot for dashboard ----------------
+        server_log(f"DONE: {cid} finished customer {customer_id}")
+    emit_snapshot()
+
+# ---------------- Snapshot and control ----------------
 def make_snapshot():
-    # with clients_lock:
-    #     clients_info = {cid: {"busy": info.get("busy"), "last_heartbeat": info.get("last_heartbeat"), "addr": info.get("addr")} for cid, info in clients.items()}
+    uptime = time.time() - start_time
     with clients_lock:
-        clients_info = {
-            cid: {
-                "busy": info.get("busy"),
-                "last_heartbeat": info.get("last_heartbeat"),
-                "addr": info.get("addr"),
-                "current_job": info.get("current_job")   # ➜ Added this line
-            }
-            for cid, info in clients.items()
-    }
+        counters = []
+        for idx, (cid, info) in enumerate(clients.items(), start=1):
+            busy = bool(info.get("busy"))
+            jobs_done = info.get("jobs_done", 0)
+            busy_time = info.get("busy_time", 0.0)
+            util = (busy_time / uptime) * 100.0 if uptime > 0 else 0.0
+            counters.append({
+                "counter": f"Counter {idx}",
+                "worker": cid,
+                "busy": busy,
+                "customer": info.get("current_job", {}).get("customer_id") if info.get("current_job") else None,
+                "service_time": info.get("current_job", {}).get("service_time") if info.get("current_job") else None,
+                "jobs_done": jobs_done,
+                "busy_time": round(busy_time, 2),
+                "util_percent": round(util, 1),
+                "addr": info.get("addr")
+            })
 
     qsize = central_queue.qsize()
+    queue_preview = list(central_queue.queue)[:20]
     with metrics_lock:
         m = metrics.copy()
-    snap = {"clients": clients_info, "queue_size": qsize, "metrics": m, "time": time.time()}
+
+    snap = {
+        "queue_size": qsize,
+        "queue_preview": queue_preview,
+        "counters": counters,
+        "metrics": m,
+        "time": time.time(),
+        "running": control["running"],
+        "customer_mean": control.get("customer_mean", CUSTOMER_MEAN),
+        "uptime": int(uptime)
+    }
     return snap
 
 def emit_snapshot():
@@ -322,43 +362,48 @@ def emit_snapshot():
     except Exception:
         pass
 
-# ---------------- Web emitter thread (periodic) ----------------
-def snapshot_emitter(stop_event):
-    while not stop_event.is_set():
-        emit_snapshot()
-        time.sleep(1.0)
+# expose control events from UI
+@sio.on("control")
+def on_control(data):
+    # data: { action: "pause" | "resume" | "set_mean", value: ... }
+    action = data.get("action")
+    if action == "pause":
+        control["running"] = False
+        server_log("Generator paused by UI")
+    elif action == "resume":
+        control["running"] = True
+        server_log("Generator resumed by UI")
+    elif action == "set_mean":
+        try:
+            v = float(data.get("value"))
+            control["customer_mean"] = max(0.2, v)
+            server_log(f"Generator mean set to {control['customer_mean']}")
+        except:
+            pass
+    elif action == "get_history":
+        jobs = recent_jobs(50)
+        sio.emit("history", jobs)
 
-# ---------------- MAIN: create pool and start threads (Windows-safe) ----------------
+# logs are also emitted in server_log
+
+# ---------------- Threads starter ----------------
 def run_server():
     stop = threading.Event()
-    # threads
-    threads = []
-    threads.append(threading.Thread(target=accept_clients, args=(stop,), daemon=True))
-    threads.append(threading.Thread(target=customer_generator, args=(stop,), daemon=True))
-    threads.append(threading.Thread(target=dispatcher, args=(stop,), daemon=True))
-    threads.append(threading.Thread(target=monitor_clients, args=(stop,), daemon=True))
-    threads.append(threading.Thread(target=snapshot_emitter, args=(stop,), daemon=True))
-
+    threads = [
+        threading.Thread(target=accept_clients, args=(stop,), daemon=True),
+        threading.Thread(target=customer_generator, args=(stop,), daemon=True),
+        threading.Thread(target=dispatcher, args=(stop,), daemon=True),
+        threading.Thread(target=monitor_clients, args=(stop,), daemon=True),
+    ]
     for t in threads:
         t.start()
-    return stop, threads
+    return stop
 
+# ---------------- Main ----------------
 if __name__ == "__main__":
-    print("[MAIN] Initializing DB...")
     init_db()
-    # create local Pool here (inside main) - Windows safe
-    print(f"[MAIN] Creating local process pool with {LOCAL_CPU_WORKERS} workers")
-    local_pool = Pool(processes=LOCAL_CPU_WORKERS)
-
-    # start server threads
-    stop_event, ths = run_server()
-
-    # run flask socketio (this blocks; snapshot_emitter thread sends updates)
-    print(f"[MAIN] Web dashboard at http://0.0.0.0:{WS_PORT}")
-    # sio.run(app, host="0.0.0.0", port=WS_PORT)
-    sio.run(app, host="0.0.0.0", port=WS_PORT, allow_unsafe_werkzeug=True)
-
-    # when socketio stops, set stop_event to shut threads (rare in development)
-    stop_event.set()
-    local_pool.close()
-    local_pool.join()
+    start_time = time.time()
+    server_log("Starting server...")
+    stop_event = run_server()
+    server_log(f"Web dashboard at http://0.0.0.0:{WS_PORT}")
+    sio.run(app, host="0.0.0.0", port=WS_PORT)

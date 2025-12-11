@@ -1,1 +1,2 @@
 # no special packages needed for the simple client
+psutil

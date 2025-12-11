@@ -2,93 +2,199 @@
 <html>
 <head>
   <meta charset="utf-8">
-  <title>Parallel Bank Dashboard</title>
+  <title>Bank Queue Dashboard — Enhanced</title>
   <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.5/socket.io.min.js"></script>
   <style>
-    body { 
-  font-family: Arial; 
-  margin: 16px; 
-  padding: 16px; 
-}
+    body { font-family: Arial; padding: 16px; background:#f5f6fa; color:#222; }
+    header { display:flex; align-items:center; justify-content:space-between; gap:12px; }
+    h1 { margin:0; font-size:20px; }
+    .wrap { display:flex; gap:16px; margin-top:12px; }
+    .left { width: 48%; }
+    .right { width: 52%; }
 
-    .panel { display:flex; gap:20px; align-items: flex-start; }
-    .box { border: 1px solid #ddd; padding: 12px; border-radius: 6px; width:320px; }
-    #clients { display:flex; gap:8px; flex-wrap:wrap; }
-    .client { padding:8px; border-radius:6px; border:1px solid #ccc; min-width:140px; }
-    .busy { background:#ffecec; }
-    .free { background:#ecffe8; }
+    .panel { background:#fff; border:1px solid #e0e3e8; padding:12px; border-radius:8px; margin-bottom:12px; }
+    .small { font-size:13px; color:#555; }
+    #counters { display:flex; gap:10px; flex-wrap:wrap; }
+
+    .counter {
+      width:220px; padding:10px; border-radius:8px; border:1px solid #ddd; background:#fcfcff;
+    }
+    .counter.busy { background: #fff2f2; border-color:#f0b0b0; }
+    .counter.free { background: #f4fff4; border-color:#b0f0b8; }
+    .muted { color:#666; font-size:12px; }
+
+    .controls { display:flex; gap:8px; align-items:center; }
+    input[type=number] { width:80px; padding:4px; }
+
+    table { width:100%; border-collapse:collapse; font-size:13px; }
+    th, td { padding:6px 8px; border-bottom:1px solid #eee; text-align:left; }
+    th { background:#fafafa; font-weight:600; }
+
+    #logbox { height:160px; overflow:auto; background:#0b1220; color:#cfefff; padding:8px; border-radius:6px; font-family:monospace; font-size:12px; }
+    .metric { display:inline-block; margin-right:12px; font-weight:600; }
+
   </style>
 </head>
 <body>
-  <h2>Parallel Bank — Live Dashboard</h2>
-  <div class="panel">
-    <div class="box">
-      <h3>Central Queue</h3>
-      <div>Queue size: <span id="queue_size">0</span></div>
-      <pre id="queue_preview">[]</pre>
+  <header>
+    <h1>Bank Multiprogramming Dashboard</h1>
+    <div class="small">Uptime: <span id="uptime">0s</span> • Running: <span id="running">yes</span></div>
+  </header>
+
+  <div class="wrap">
+    <div class="left">
+      <div class="panel">
+        <div style="display:flex; justify-content:space-between; align-items:center;">
+          <div><strong>Queue</strong> <span class="muted"> (next customers)</span></div>
+          <div class="small">Queue size: <span id="queue_size">0</span></div>
+        </div>
+        <pre id="queue_preview" style="height:90px; overflow:auto; background:#fafafa; padding:8px; border-radius:4px;"></pre>
+      </div>
+
+      <div class="panel">
+        <div style="display:flex; justify-content:space-between; align-items:center;">
+          <div><strong>Counters</strong></div>
+          <div class="small">Workers: <span id="worker_count">0</span></div>
+        </div>
+        <div id="counters" style="margin-top:8px;"></div>
+      </div>
+
+      <div class="panel">
+        <div style="display:flex; justify-content:space-between; align-items:center;">
+          <div><strong>Controls</strong></div>
+          <div class="small">Adjust generator</div>
+        </div>
+        <div style="margin-top:8px;" class="controls">
+          <button id="btnPause">Pause</button>
+          <button id="btnResume">Resume</button>
+          <label style="margin-left:8px;">Mean (s):</label>
+          <input id="meanInput" type="number" step="0.1" min="0.2" value="1.2">
+          <button id="btnSet">Set</button>
+          <button id="btnGetHistory" style="margin-left:auto;">Load History</button>
+        </div>
+      </div>
+
+      <div class="panel">
+        <strong>Logs</strong>
+        <div id="logbox"></div>
+      </div>
     </div>
 
-    <div class="box">
-      <h3>Clients</h3>
-      <div id="clients">No clients</div>
-    </div>
+    <div class="right">
+      <div class="panel">
+        <div style="display:flex; justify-content:space-between;">
+          <div><strong>Metrics</strong></div>
+          <div class="small">Last update: <span id="last_update">-</span></div>
+        </div>
+        <div style="margin-top:8px;">
+          <span class="metric">Generated: <span id="m_gen">0</span></span>
+          <span class="metric">Dispatched: <span id="m_disp">0</span></span>
+          <span class="metric">Completed: <span id="m_comp">0</span></span>
+          <span class="metric">Mean: <span id="m_mean">1.2</span>s</span>
+        </div>
+      </div>
 
-    <div class="box">
-      <h3>Metrics</h3>
-      <div>Total generated: <span id="m_gen">0</span></div>
-      <div>Total dispatched: <span id="m_disp">0</span></div>
-      <div>Total completed: <span id="m_comp">0</span></div>
-      <div>Last update: <span id="last_update">-</span></div>
+      <div class="panel">
+        <strong>Recent Job History (last 50)</strong>
+        <table>
+          <thead><tr><th>ID</th><th>Arr</th><th>Start</th><th>Finish</th><th>Service</th><th>Worker</th></tr></thead>
+          <tbody id="history_body"></tbody>
+        </table>
+      </div>
+
+      <div class="panel">
+        <strong>Quick Info</strong>
+        <div style="margin-top:8px;">
+          <div>Customer generator: <span id="running_state">running</span></div>
+          <div>Connected workers: <span id="workers_connected">0</span></div>
+        </div>
+      </div>
     </div>
   </div>
 
 <script>
   const socket = io();
 
-  function renderClients(info) {
-  const cont = document.getElementById('clients');
-  cont.innerHTML = '';
-  const keys = Object.keys(info);
-  if (keys.length === 0) { 
-    cont.innerText = 'No clients connected'; 
-    return; 
+  const logbox = document.getElementById("logbox");
+  function addLog(line) {
+    const atBottom = (logbox.scrollTop + logbox.clientHeight + 20) >= logbox.scrollHeight;
+    logbox.innerText = (logbox.innerText ? logbox.innerText + "\n" : "") + line;
+    if (atBottom) logbox.scrollTop = logbox.scrollHeight;
   }
-  for (const id of keys) {
-    const v = info[id];
-    const div = document.createElement('div');
-    div.className = 'client ' + (v.busy ? 'busy' : 'free');
 
-    // NEW: show which job the client is working on
-    let job = v.current_job ? `Customer ${v.current_job.customer_id}` : '';
+  socket.on("connect", () => addLog("[UI] connected"));
+  socket.on("disconnect", () => addLog("[UI] disconnected"));
 
-    div.innerHTML = `
-      <strong>${id}</strong>
-      <div>${v.addr ? v.addr[0] + ':' + v.addr[1] : ''}</div>
-      <div>${v.busy ? 'Busy — ' + job : 'Free'}</div>
-    `;
-
-    cont.appendChild(div);
-  }
-}
-
-
-  socket.on('snapshot', s => {
-    document.getElementById('queue_size').innerText = s.queue_size;
-    document.getElementById('queue_preview').innerText = 'Queue size: ' + s.queue_size;
-    document.getElementById('m_gen').innerText = s.metrics.total_generated;
-    document.getElementById('m_disp').innerText = s.metrics.total_dispatched;
-    document.getElementById('m_comp').innerText = s.metrics.total_completed;
-    document.getElementById('last_update').innerText = new Date(s.time*1000).toLocaleTimeString();
-    renderClients(s.clients);
+  socket.on("log", (line) => {
+    addLog(line);
   });
 
-  socket.on('connect', () => {
-    console.log('connected to server dashboard');
+  socket.on("snapshot", (s) => {
+    document.getElementById("queue_size").innerText = s.queue_size;
+    document.getElementById("queue_preview").innerText = JSON.stringify(s.queue_preview.slice(0,20), null, 2);
+    document.getElementById("m_gen").innerText = s.metrics.total_generated;
+    document.getElementById("m_disp").innerText = s.metrics.total_dispatched;
+    document.getElementById("m_comp").innerText = s.metrics.total_completed;
+    document.getElementById("last_update").innerText = new Date(s.time*1000).toLocaleTimeString();
+    document.getElementById("m_mean").innerText = s.customer_mean;
+    document.getElementById("running").innerText = s.running ? "yes" : "no";
+    document.getElementById("running_state").innerText = s.running ? "running" : "paused";
+    document.getElementById("uptime").innerText = s.uptime + "s";
+    document.getElementById("worker_count").innerText = s.counters.length;
+    document.getElementById("workers_connected").innerText = s.counters.length;
+
+    // counters
+    const cdiv = document.getElementById("counters");
+    cdiv.innerHTML = "";
+    s.counters.forEach(c => {
+      const el = document.createElement("div");
+      el.className = "counter " + (c.busy ? "busy" : "free");
+      el.innerHTML = `
+        <div style="font-weight:700">${c.counter}</div>
+        <div class="muted">worker: ${c.worker}</div>
+        <div style="margin-top:6px"><strong>Status:</strong> ${c.busy ? "Busy" : "Free"}</div>
+        <div class="muted">Customer: ${c.customer ?? "-"}</div>
+        <div class="muted">Service: ${c.service_time ?? "-"}</div>
+        <div class="muted">Done: ${c.jobs_done} • Busy time: ${c.busy_time}s</div>
+        <div style="margin-top:6px">Util: ${c.util_percent}%</div>
+      `;
+      cdiv.appendChild(el);
+    });
   });
 
-  socket.on('disconnect', () => {
-    console.log('disconnected from server dashboard');
+  // history payload
+  socket.on("history", (jobs) => {
+    const tbody = document.getElementById("history_body");
+    tbody.innerHTML = "";
+    jobs.forEach(j => {
+      const tr = document.createElement("tr");
+      function fmt(ts) { return ts ? new Date(ts*1000).toLocaleTimeString() : "-"; }
+      tr.innerHTML = `<td>${j.customer_id}</td>
+                      <td>${fmt(j.arrival)}</td>
+                      <td>${fmt(j.started)}</td>
+                      <td>${fmt(j.finished)}</td>
+                      <td>${j.service_time ?? "-"}</td>
+                      <td>${j.assigned_worker ?? "-"}</td>`;
+      tbody.appendChild(tr);
+    });
   });
+
+  // control buttons
+  document.getElementById("btnPause").addEventListener("click", () => {
+    socket.emit("control", { action: "pause" });
+  });
+  document.getElementById("btnResume").addEventListener("click", () => {
+    socket.emit("control", { action: "resume" });
+  });
+  document.getElementById("btnSet").addEventListener("click", () => {
+    const val = parseFloat(document.getElementById("meanInput").value);
+    if (isNaN(val) || val < 0.2) return alert("Mean must be >= 0.2");
+    socket.emit("control", { action: "set_mean", value: val });
+  });
+  document.getElementById("btnGetHistory").addEventListener("click", () => {
+    socket.emit("control", { action: "get_history" });
+  });
+
 </script>
 </body>
 </html>
