@@ -32,37 +32,45 @@ def send_heartbeat(sock, client_id):
 def handle_server(sock, simulate_cpu):
     buf = b''
     client_id = None
-    while True:
-        data = sock.recv(4096)
-        if not data:
-            print("[CLIENT] server closed")
-            break
-        buf += data
-        while b'\n' in buf:
-            line, buf = buf.split(b'\n', 1)
-            if not line: continue
-            try:
-                msg = json.loads(line.decode())
-            except:
-                continue
-            typ = msg.get('type')
-            if typ == 'assign':
-                client_id = msg.get('id')
-                print("[CLIENT] assigned id", client_id)
-                threading.Thread(target=send_heartbeat, args=(sock,client_id), daemon=True).start()
-            elif typ == 'job':
-                cust = msg.get('customer_id')
-                st = float(msg.get('service_time', 2.0))
-                print(f"[CLIENT] Received job {cust} st={st}")
-                if simulate_cpu:
-                    cpu_heavy(st)
-                else:
-                    time.sleep(st)
-                done = {"type":"done", "customer_id": cust, "service_time": st}
+    try:
+        while True:
+            data = sock.recv(4096)
+            if not data:
+                print("[CLIENT] server closed")
+                break
+            buf += data
+            while b'\n' in buf:
+                line, buf = buf.split(b'\n', 1)
+                if not line: continue
                 try:
-                    sock.sendall((json.dumps(done) + "\n").encode())
-                except Exception as e:
-                    print("[CLIENT] failed to send done", e)
+                    msg = json.loads(line.decode())
+                except:
+                    continue
+                typ = msg.get('type')
+                if typ == 'assign':
+                    client_id = msg.get('id')
+                    print("[CLIENT] assigned id", client_id)
+                    threading.Thread(target=send_heartbeat, args=(sock,client_id), daemon=True).start()
+                elif typ == 'job':
+                    cust = msg.get('customer_id')
+                    st = float(msg.get('service_time', 2.0))
+                    print(f"[CLIENT] Received job {cust} st={st}")
+                    if simulate_cpu:
+                        cpu_heavy(st)
+                    else:
+                        time.sleep(st)
+                    done = {"type":"done", "customer_id": cust, "service_time": st}
+                    try:
+                        sock.sendall((json.dumps(done) + "\n").encode())
+                    except Exception as e:
+                        print("[CLIENT] failed to send done", e)
+    except Exception as e:
+        print("[CLIENT] error", e)
+    finally:
+        try:
+            sock.close()
+        except:
+            pass
 
 def main():
     if len(sys.argv) < 2:
